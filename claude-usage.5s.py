@@ -1,0 +1,277 @@
+#!/usr/bin/env python3
+"""
+Claude usage — macOS menu bar widget (SwiftBar / xbar plugin)
+
+Shows your Claude account's rolling usage windows (5-hour session, 7-day
+weekly, and any per-model windows such as Fable) live in the menu bar.
+
+INSTALL
+  1. Install SwiftBar (https://swiftbar.app) — or `brew install --cask swiftbar`.
+  2. Launch it and pick a plugin folder when prompted.
+  3. Drag this file into that folder, keeping the name:  claude-usage.5s.py
+     (the ".5s." is SwiftBar's refresh interval — 5 seconds. Use .30s. or
+      .1m. if you want it lazier; see CACHE_SECONDS below before you do.)
+  4. SwiftBar → Refresh all.
+
+  SwiftBar sets the executable bit itself, so no chmod is needed. You must have
+  signed in to Claude Code at least once — this reads the token it saved.
+
+DEBUG
+  Run it straight from the terminal to see the raw API response and the
+  actual field names your account returns:
+
+      ./claude-usage.5s.py --debug
+
+DATA SOURCE — READ THIS
+  This calls https://api.anthropic.com/api/oauth/usage, an UNDOCUMENTED
+  endpoint. It is not a supported API. It may change or vanish without
+  notice, in which case this widget will show an error and you can bin it.
+  The OAuth token is read locally from the same place Claude Code keeps it
+  (macOS Keychain, falling back to ~/.claude/.credentials.json). Nothing is
+  sent anywhere except Anthropic's own API. No token is written to disk by
+  this script.
+"""
+
+import json
+import os
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+from datetime import datetime, timezone
+from pathlib import Path
+
+# ── Config ────────────────────────────────────────────────────────────────
+CACHE_SECONDS = 120     # don't hit the API more often than this. The menu bar
+                        # redraws every 5s from cache; only every 2 min does it
+                        # actually call out. Lower it and you risk 429s.
+WARN_AT = 50            # append  !   at this utilisation %
+ALERT_AT = 80           # append  !!  at this utilisation %
+BAR_WIDTH = 10
+CACHE_FILE = Path(os.environ.get("TMPDIR", "/tmp")) / "claude-usage-widget.json"
+
+# Pretty names for the structured `limits[]` entries the API returns. Per-model
+# scopes (Fable, Opus, …) are labelled from their own display_name, so they
+# don't need an entry here — they appear automatically.
+LIMIT_LABELS = {
+    "session": "Session (5h)",
+    "weekly_all": "Weekly (7d)",
+    "weekly_scoped": "Scoped (7d)",
+}
+
+# Fallback labels for the older top-level window shape (five_hour, seven_day…),
+# used only when the response has no `limits[]` array.
+LABELS = {
+    "five_hour": "Session (5h)",
+    "seven_day": "Weekly (7d)",
+    "seven_day_opus": "Opus (7d)",
+    "seven_day_sonnet": "Sonnet (7d)",
+    "seven_day_fable": "Fable (7d)",
+    "seven_day_oauth_apps": "Apps (7d)",
+}
+
+FONT = "font=Menlo size=12"
+
+
+# ── Credentials ───────────────────────────────────────────────────────────
+def get_token():
+    """Read Claude Code's OAuth token. Keychain first (macOS), then file."""
+    try:
+        raw = subprocess.run(
+            ["security", "find-generic-password", "-s", "Claude Code-credentials", "-w"],
+            capture_output=True, text=True, timeout=5,
+        ).stdout.strip()
+        if raw:
+            return json.loads(raw)["claudeAiOauth"]["accessToken"]
+    except Exception:
+        pass
+
+    creds = Path.home() / ".claude" / ".credentials.json"
+    try:
+        return json.loads(creds.read_text())["claudeAiOauth"]["accessToken"]
+    except Exception:
+        return None
+
+
+# ── API ───────────────────────────────────────────────────────────────────
+def fetch_usage(token):
+    req = urllib.request.Request(
+        "https://api.anthropic.com/api/oauth/usage",
+        headers={
+            "Authorization": f"Bearer {token}",
+            "anthropic-beta": "oauth-2025-04-20",
+            "Content-Type": "application/json",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=8) as r:
+        return json.loads(r.read())
+
+
+def cached_usage(token, force=False):
+    """Serve from cache unless it's stale. Keeps us well clear of rate limits."""
+    if not force and CACHE_FILE.exists():
+        try:
+            blob = json.loads(CACHE_FILE.read_text())
+            if time.time() - blob["fetched_at"] < CACHE_SECONDS:
+                return blob["data"], True
+        except Exception:
+            pass
+
+    data = fetch_usage(token)
+    try:
+        old = os.umask(0o077)
+        CACHE_FILE.write_text(json.dumps({"fetched_at": time.time(), "data": data}))
+        os.umask(old)
+    except Exception:
+        pass
+    return data, False
+
+
+# ── Rendering ─────────────────────────────────────────────────────────────
+def _label_for_limit(lim):
+    scope = lim.get("scope") or {}
+    model = (scope.get("model") or {}).get("display_name") if isinstance(scope, dict) else None
+    if model:
+        return f"{model} (7d)"
+    kind = lim.get("kind") or ""
+    return LIMIT_LABELS.get(kind, kind.replace("_", " ").title() or "Usage")
+
+
+SESSION_LABEL = LIMIT_LABELS["session"]
+
+
+def _order(w):
+    """Session window pinned first; everything else worst-first behind it."""
+    return (0 if w[0] == SESSION_LABEL else 1, -w[1])
+
+
+def windows(data):
+    """Return [(label, pct, resets_at)] for every usage window.
+
+    The 5-hour session window always comes first; the rest follow worst-first.
+
+    Prefers the structured `limits[]` array — it carries per-model scopes such
+    as Fable with real display names, which the top-level keys no longer do
+    (they come back null). Falls back to discovering top-level `utilization`
+    windows for older/other response shapes."""
+    limits = data.get("limits")
+    if isinstance(limits, list) and limits:
+        out = []
+        for lim in limits:
+            if not isinstance(lim, dict) or lim.get("percent") is None:
+                continue
+            out.append((_label_for_limit(lim), float(lim["percent"]), lim.get("resets_at")))
+        if out:
+            return sorted(out, key=_order)
+
+    # Fallback: any top-level object carrying a numeric 'utilization'. A null
+    # utilization (e.g. extra_usage when disabled) is not a real window.
+    out = []
+    for key, val in data.items():
+        if not isinstance(val, dict) or val.get("utilization") is None:
+            continue
+        pct = val["utilization"]
+        pct = pct * 100 if pct <= 1 else pct   # tolerate 0-1 or 0-100
+        label = LABELS.get(key, key.replace("_", " ").title())
+        out.append((label, float(pct), val.get("resets_at")))
+    return sorted(out, key=_order)
+
+
+def bar(pct):
+    filled = min(BAR_WIDTH, max(0, round(pct / 100 * BAR_WIDTH)))
+    return "█" * filled + "░" * (BAR_WIDTH - filled)
+
+
+def sigil(pct):
+    # Plain-text severity marker — no colour, no emoji anywhere in this plugin.
+    if pct >= ALERT_AT:
+        return "!!"
+    if pct >= WARN_AT:
+        return "!"
+    return ""
+
+
+def resets_in(iso):
+    if not iso:
+        return ""
+    try:
+        t = datetime.fromisoformat(iso.replace("Z", "+00:00"))
+        secs = (t - datetime.now(timezone.utc)).total_seconds()
+        if secs <= 0:
+            return "resetting"
+        h, m = int(secs // 3600), int((secs % 3600) // 60)
+        return f"resets in {h}h {m:02d}m" if h else f"resets in {m}m"
+    except Exception:
+        return ""
+
+
+def die(headline, detail=""):
+    print(f"Claude usage: error | {FONT}")
+    print("---")
+    print(f"{headline} | {FONT}")
+    if detail:
+        print(f"{detail} | {FONT} length=60")
+    print("---")
+    print(f"Refresh | refresh=true {FONT}")
+    sys.exit(0)
+
+
+def main():
+    debug = "--debug" in sys.argv
+
+    token = get_token()
+    if not token:
+        die("Not logged in to Claude Code",
+            "Run `claude` once to authenticate, then refresh.")
+
+    try:
+        data, from_cache = cached_usage(token, force=debug)
+    except urllib.error.HTTPError as e:
+        if e.code in (401, 403):
+            die("Token rejected (401/403)",
+                "Token may lack user:profile scope. Log out and back in to Claude Code.")
+        if e.code == 429:
+            die("Rate limited (429)", "Raise CACHE_SECONDS in this script.")
+        die(f"API error {e.code}", "The usage endpoint is undocumented and may have changed.")
+    except Exception as e:
+        die("Could not reach usage API", str(e))
+
+    if debug:
+        print("=== RAW RESPONSE ===")
+        print(json.dumps(data, indent=2))
+        print("\n=== PARSED WINDOWS ===")
+        for label, pct, reset in windows(data):
+            print(f"  {label:<24} {pct:5.1f}%  {reset or '-'}")
+        return
+
+    ws = windows(data)
+    if not ws:
+        die("No usage windows in response",
+            "Run with --debug to see what the API actually returned.")
+
+    # ── Menu bar line: the session window (ws[0] is pinned to it) ──
+    # The percentage shown is the session's, but the marker tracks the hottest
+    # window of them all, so a near-full weekly limit still shouts (! at
+    # WARN_AT, !! at ALERT_AT). No colour or emoji anywhere — plain text only,
+    # so it reads cleanly in both light and dark menu bars.
+    _, top_pct, _ = ws[0]
+    mark = sigil(max(pct for _, pct, _ in ws))
+    print(f"{top_pct:.0f}%{(' ' + mark) if mark else ''} | {FONT}")
+
+    # ── Dropdown: session first, then the rest worst-first ──
+    print("---")
+    for label, pct, reset in ws:
+        print(f"{label:<14} {bar(pct)} {pct:5.1f}% {sigil(pct)} | {FONT}")
+        r = resets_in(reset)
+        if r:
+            print(f"{'':<14} {r} | {FONT}")
+
+    print("---")
+    age = "cached" if from_cache else "fresh"
+    print(f"Updated {datetime.now().strftime('%H:%M:%S')} ({age}) | {FONT}")
+    print(f"Refresh now | refresh=true {FONT}")
+
+
+if __name__ == "__main__":
+    main()
