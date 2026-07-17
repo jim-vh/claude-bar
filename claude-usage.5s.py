@@ -330,7 +330,7 @@ def main():
     elif age < CACHE_SECONDS:
         state = f"cached {int(age)}s"
     else:
-        state = f"stale {int(age // 60)}m"   # API unreachable; last good reading
+        state = f"stale {int(age // 60)}m"   #API unreachable; last good reading
     print(f"Updated {datetime.now().strftime('%H:%M:%S')} ({state}) | {FONT}")
     print(f"Refresh now | refresh=true {FONT}")
 
