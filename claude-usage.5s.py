@@ -6,21 +6,23 @@ Shows your Claude account's rolling usage windows (5-hour session, 7-day
 weekly, and any per-model windows such as Fable) live in the menu bar.
 
 INSTALL
-  1. Install SwiftBar (https://swiftbar.app) — or `brew install --cask swiftbar`.
-  2. Launch it and pick a plugin folder when prompted.
-  3. Drag this file into that folder, keeping the name:  claude-usage.5s.py
+  1. brew install --cask swiftbar        # or xbar
+  2. Launch SwiftBar, pick a plugin folder when prompted.
+  3. Copy this file into that folder, keeping the name:  claude-usage.5s.py
      (the ".5s." is SwiftBar's refresh interval — 5 seconds. Use .30s. or
       .1m. if you want it lazier; see CACHE_SECONDS below before you do.)
-  4. SwiftBar → Refresh all.
-
-  SwiftBar sets the executable bit itself, so no chmod is needed. You must have
-  signed in to Claude Code at least once — this reads the token it saved.
+  4. chmod +x claude-usage.5s.py
+  5. SwiftBar → Refresh all.
 
 DEBUG
   Run it straight from the terminal to see the raw API response and the
   actual field names your account returns:
 
-      ./claude-usage.5s.py --debug
+      ./claude-usage.5s.py --debug            # reads through the cache
+      ./claude-usage.5s.py --debug --force    # forces a live API call
+
+  --debug on its own is cache-friendly, so you can run it as often as you
+  like. Only --force actually calls out, and only that can earn you a 429.
 
 DATA SOURCE — READ THIS
   This calls https://api.anthropic.com/api/oauth/usage, an UNDOCUMENTED
@@ -46,6 +48,8 @@ from pathlib import Path
 CACHE_SECONDS = 120     # don't hit the API more often than this. The menu bar
                         # redraws every 5s from cache; only every 2 min does it
                         # actually call out. Lower it and you risk 429s.
+BACKOFF_MAX = 1800      # ceiling on the post-429 backoff, in seconds
+STALE_MAX = 3600        # past this age a cached response is too old to show
 WARN_AT = 50            # append  !   at this utilisation %
 ALERT_AT = 80           # append  !!  at this utilisation %
 BAR_WIDTH = 10
@@ -108,24 +112,73 @@ def fetch_usage(token):
         return json.loads(r.read())
 
 
-def cached_usage(token, force=False):
-    """Serve from cache unless it's stale. Keeps us well clear of rate limits."""
-    if not force and CACHE_FILE.exists():
-        try:
-            blob = json.loads(CACHE_FILE.read_text())
-            if time.time() - blob["fetched_at"] < CACHE_SECONDS:
-                return blob["data"], True
-        except Exception:
-            pass
+def _read_cache():
+    try:
+        return json.loads(CACHE_FILE.read_text())
+    except Exception:
+        return {}
 
-    data = fetch_usage(token)
+
+def _write_cache(blob):
     try:
         old = os.umask(0o077)
-        CACHE_FILE.write_text(json.dumps({"fetched_at": time.time(), "data": data}))
+        CACHE_FILE.write_text(json.dumps(blob))
         os.umask(old)
     except Exception:
         pass
-    return data, False
+
+
+def _retry_after(e):
+    """Seconds the server asked us to wait, if it said so."""
+    try:
+        return max(0, int(e.headers.get("Retry-After", "")))
+    except Exception:
+        return None
+
+
+def cached_usage(token, force=False):
+    """Serve from cache unless it's stale. Keeps us well clear of rate limits.
+
+    Returns (data, age_seconds). A live fetch has age 0.
+
+    Three layers keep us off the API:
+      1. CACHE_SECONDS — the normal "don't ask again yet" window.
+      2. A backoff after a 429, doubling each time up to BACKOFF_MAX, honouring
+         Retry-After when the server sends one. Without this the 5s refresh just
+         hammers the endpoint while it's telling us to back off.
+      3. On any fetch failure, the last good response is served (up to
+         STALE_MAX) rather than blanking the widget out with an error.
+    """
+    blob = _read_cache()
+    now = time.time()
+    data, fetched_at = blob.get("data"), blob.get("fetched_at", 0)
+    age = now - fetched_at if data else None
+
+    fresh = age is not None and age < CACHE_SECONDS
+    backing_off = now < blob.get("retry_at", 0)
+    if not force and (fresh or (backing_off and age is not None and age < STALE_MAX)):
+        return data, age
+
+    try:
+        fetched = fetch_usage(token)
+    except urllib.error.HTTPError as e:
+        if e.code == 429:
+            # Double the backoff each consecutive 429; the server's Retry-After
+            # wins if it gave us one. Reset on the next success.
+            wait = _retry_after(e) or min(BACKOFF_MAX, max(CACHE_SECONDS, blob.get("backoff", 0) * 2))
+            blob["backoff"] = wait
+            blob["retry_at"] = now + wait
+            _write_cache(blob)
+        if data is not None and age < STALE_MAX:
+            return data, age      # ride out the error on the last good response
+        raise
+    except Exception:
+        if data is not None and age < STALE_MAX:
+            return data, age
+        raise
+
+    _write_cache({"fetched_at": now, "data": fetched})
+    return fetched, 0
 
 
 # ── Rendering ─────────────────────────────────────────────────────────────
@@ -219,6 +272,9 @@ def die(headline, detail=""):
 
 def main():
     debug = "--debug" in sys.argv
+    # --debug reads through the cache like a normal run; --force is the opt-in
+    # for a live call. Debugging shouldn't cost you a rate limit.
+    force = "--force" in sys.argv
 
     token = get_token()
     if not token:
@@ -226,19 +282,20 @@ def main():
             "Run `claude` once to authenticate, then refresh.")
 
     try:
-        data, from_cache = cached_usage(token, force=debug)
+        data, age = cached_usage(token, force=force)
     except urllib.error.HTTPError as e:
         if e.code in (401, 403):
             die("Token rejected (401/403)",
                 "Token may lack user:profile scope. Log out and back in to Claude Code.")
         if e.code == 429:
-            die("Rate limited (429)", "Raise CACHE_SECONDS in this script.")
+            die("Rate limited (429)",
+                "Backing off automatically. No cached usage to fall back on yet.")
         die(f"API error {e.code}", "The usage endpoint is undocumented and may have changed.")
     except Exception as e:
         die("Could not reach usage API", str(e))
 
     if debug:
-        print("=== RAW RESPONSE ===")
+        print(f"=== RAW RESPONSE ({'live' if age == 0 else f'cached, {int(age)}s old'}) ===")
         print(json.dumps(data, indent=2))
         print("\n=== PARSED WINDOWS ===")
         for label, pct, reset in windows(data):
@@ -268,8 +325,13 @@ def main():
             print(f"{'':<14} {r} | {FONT}")
 
     print("---")
-    age = "cached" if from_cache else "fresh"
-    print(f"Updated {datetime.now().strftime('%H:%M:%S')} ({age}) | {FONT}")
+    if age == 0:
+        state = "fresh"
+    elif age < CACHE_SECONDS:
+        state = f"cached {int(age)}s"
+    else:
+        state = f"stale {int(age // 60)}m"   # API unreachable; last good reading
+    print(f"Updated {datetime.now().strftime('%H:%M:%S')} ({state}) | {FONT}")
     print(f"Refresh now | refresh=true {FONT}")
 
 
