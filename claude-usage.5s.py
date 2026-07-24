@@ -79,23 +79,44 @@ FONT = "font=Menlo size=12"
 
 
 # ── Credentials ───────────────────────────────────────────────────────────
-def get_token():
-    """Read Claude Code's OAuth token. Keychain first (macOS), then file."""
+def get_oauth():
+    """Read Claude Code's OAuth blob. Keychain first (macOS), then file.
+
+    Returns the `claudeAiOauth` dict (accessToken, expiresAt, …) or None. None
+    means Claude Code hasn't signed in on this machine yet — a wait-for-it state,
+    not an error: the entry appears in the Keychain once Claude Code has run.
+    """
     try:
         raw = subprocess.run(
             ["security", "find-generic-password", "-s", "Claude Code-credentials", "-w"],
             capture_output=True, text=True, timeout=5,
         ).stdout.strip()
         if raw:
-            return json.loads(raw)["claudeAiOauth"]["accessToken"]
+            return json.loads(raw)["claudeAiOauth"]
     except Exception:
         pass
 
     creds = Path.home() / ".claude" / ".credentials.json"
     try:
-        return json.loads(creds.read_text())["claudeAiOauth"]["accessToken"]
+        return json.loads(creds.read_text())["claudeAiOauth"]
     except Exception:
         return None
+
+
+def token_expired(oauth):
+    """True if the stored access token's expiry has passed.
+
+    Only Claude Code refreshes this token (when it next runs), so an expired
+    token means "waiting for Claude Code", not a real auth failure. We check it
+    up front to avoid firing a doomed request at the endpoint every refresh.
+
+    `expiresAt` is epoch milliseconds in current Claude Code builds; we tolerate
+    seconds too. An absent/odd value returns False — let the API be the judge."""
+    exp = oauth.get("expiresAt")
+    if not isinstance(exp, (int, float)):
+        return False
+    exp_s = exp / 1000 if exp > 1e11 else exp   # ms → s if it looks like ms
+    return time.time() >= exp_s
 
 
 # ── API ───────────────────────────────────────────────────────────────────
@@ -259,54 +280,12 @@ def resets_in(iso):
         return ""
 
 
-def die(headline, detail=""):
-    print(f"Claude usage: error | {FONT}")
-    print("---")
-    print(f"{headline} | {FONT}")
-    if detail:
-        print(f"{detail} | {FONT} length=60")
-    print("---")
-    print(f"Refresh | refresh=true {FONT}")
-    sys.exit(0)
+def render(ws, age, note=None):
+    """Draw the menu bar line and dropdown for a set of usage windows.
 
-
-def main():
-    debug = "--debug" in sys.argv
-    # --debug reads through the cache like a normal run; --force is the opt-in
-    # for a live call. Debugging shouldn't cost you a rate limit.
-    force = "--force" in sys.argv
-
-    token = get_token()
-    if not token:
-        die("Not logged in to Claude Code",
-            "Run `claude` once to authenticate, then refresh.")
-
-    try:
-        data, age = cached_usage(token, force=force)
-    except urllib.error.HTTPError as e:
-        if e.code in (401, 403):
-            die("Token rejected (401/403)",
-                "Token may lack user:profile scope. Log out and back in to Claude Code.")
-        if e.code == 429:
-            die("Rate limited (429)",
-                "Backing off automatically. No cached usage to fall back on yet.")
-        die(f"API error {e.code}", "The usage endpoint is undocumented and may have changed.")
-    except Exception as e:
-        die("Could not reach usage API", str(e))
-
-    if debug:
-        print(f"=== RAW RESPONSE ({'live' if age == 0 else f'cached, {int(age)}s old'}) ===")
-        print(json.dumps(data, indent=2))
-        print("\n=== PARSED WINDOWS ===")
-        for label, pct, reset in windows(data):
-            print(f"  {label:<24} {pct:5.1f}%  {reset or '-'}")
-        return
-
-    ws = windows(data)
-    if not ws:
-        die("No usage windows in response",
-            "Run with --debug to see what the API actually returned.")
-
+    Shared by the normal path and the calm 'waiting' fallback, so a stale-but-
+    real reading looks identical to a live one bar the footer's freshness tag.
+    """
     # ── Menu bar line: the session window (ws[0] is pinned to it) ──
     # The percentage shown is the session's, but the marker tracks the hottest
     # window of them all, so a near-full weekly limit still shouts (! at
@@ -330,9 +309,117 @@ def main():
     elif age < CACHE_SECONDS:
         state = f"cached {int(age)}s"
     else:
-        state = f"stale {int(age // 60)}m"   #API unreachable; last good reading
+        state = f"stale {int(age // 60)}m"   # API unreachable; last good reading
     print(f"Updated {datetime.now().strftime('%H:%M:%S')} ({state}) | {FONT}")
+    if note:
+        print(f"{note} | {FONT} length=60")
     print(f"Refresh now | refresh=true {FONT}")
+
+
+def _last_good():
+    """The most recent cached reading if still within STALE_MAX, else (None, None).
+
+    Lets the 'waiting' state keep showing real numbers while Claude Code (or the
+    network) comes back, instead of blanking the widget out."""
+    blob = _read_cache()
+    data, fetched_at = blob.get("data"), blob.get("fetched_at", 0)
+    if not data:
+        return None, None
+    age = time.time() - fetched_at
+    return (data, age) if age < STALE_MAX else (None, None)
+
+
+def waiting(headline, detail=""):
+    """Calm 'not ready yet' state — the widget is fine, it's just waiting on
+    Claude Code (or the network) to come back. Never the word 'error'.
+
+    Prefers to keep the last good reading on screen (stale-marked) with the
+    reason as a footnote; falls back to a neutral placeholder when there's
+    nothing cached. SwiftBar keeps refreshing on its own, so this self-heals the
+    moment Claude Code reconnects — no user action required."""
+    data, age = _last_good()
+    if data is not None:
+        ws = windows(data)
+        if ws:
+            render(ws, age, note=headline)
+            sys.exit(0)
+
+    print(f"Claude usage: … | {FONT}")
+    print("---")
+    print(f"{headline} | {FONT}")
+    if detail:
+        print(f"{detail} | {FONT} length=60")
+    print("---")
+    print(f"Refresh | refresh=true {FONT}")
+    sys.exit(0)
+
+
+def die(headline, detail=""):
+    print(f"Claude usage: error | {FONT}")
+    print("---")
+    print(f"{headline} | {FONT}")
+    if detail:
+        print(f"{detail} | {FONT} length=60")
+    print("---")
+    print(f"Refresh | refresh=true {FONT}")
+    sys.exit(0)
+
+
+def main():
+    debug = "--debug" in sys.argv
+    # --debug reads through the cache like a normal run; --force is the opt-in
+    # for a live call. Debugging shouldn't cost you a rate limit.
+    force = "--force" in sys.argv
+
+    oauth = get_oauth()
+    token = (oauth or {}).get("accessToken")
+    if not token:
+        # Claude Code hasn't signed in on this machine yet. Not an error — the
+        # token lands in the Keychain once Claude Code runs, and we pick it up on
+        # the next refresh. Wait for it rather than shouting.
+        waiting("Waiting for Claude Code to sign in",
+                "Run `claude` once; this updates on its own after.")
+
+    if not force and not debug and token_expired(oauth):
+        # The stored token has lapsed and only Claude Code refreshes it. Don't
+        # fire a doomed 401 at the endpoint every refresh — wait it out, keeping
+        # the last good reading on screen. It self-heals when Claude Code runs.
+        waiting("Waiting for Claude Code to refresh its token",
+                "The saved token expired; Claude Code refreshes it when it runs.")
+
+    try:
+        data, age = cached_usage(token, force=force)
+    except urllib.error.HTTPError as e:
+        if e.code in (401, 403):
+            # Rejected — nearly always a lapsed token Claude Code hasn't yet
+            # refreshed. Wait for it to reconnect instead of erroring out.
+            waiting("Waiting for Claude Code to refresh its token",
+                    "Claude Code refreshes the saved token when it runs.")
+        if e.code == 429:
+            # Backing off automatically and nothing cached to show yet. Transient,
+            # not an error — it clears itself.
+            waiting("Rate limited — backing off",
+                    "Retrying automatically; this clears on its own.")
+        die(f"API error {e.code}", "The usage endpoint is undocumented and may have changed.")
+    except Exception as e:
+        # Network not up yet (e.g. straight after boot), DNS, timeout… all
+        # transient. Wait and let SwiftBar's next refresh retry.
+        waiting("Reconnecting to the usage API…", str(e))
+
+    if debug:
+        print(f"=== RAW RESPONSE ({'live' if age == 0 else f'cached, {int(age)}s old'}) ===")
+        print(json.dumps(data, indent=2))
+        print("\n=== PARSED WINDOWS ===")
+        for label, pct, reset in windows(data):
+            print(f"  {label:<24} {pct:5.1f}%  {reset or '-'}")
+        return
+
+    ws = windows(data)
+    if not ws:
+        die("No usage windows in response",
+            "Run with --debug to see what the API actually returned.")
+
+    render(ws, age)
 
 
 if __name__ == "__main__":
