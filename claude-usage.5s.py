@@ -286,14 +286,16 @@ def render(ws, age, note=None):
     Shared by the normal path and the calm 'waiting' fallback, so a stale-but-
     real reading looks identical to a live one bar the footer's freshness tag.
     """
-    # ── Menu bar line: the session window (ws[0] is pinned to it) ──
-    # The percentage shown is the session's, but the marker tracks the hottest
-    # window of them all, so a near-full weekly limit still shouts (! at
-    # WARN_AT, !! at ALERT_AT). No colour or emoji anywhere — plain text only,
-    # so it reads cleanly in both light and dark menu bars.
-    _, top_pct, _ = ws[0]
-    mark = sigil(max(pct for _, pct, _ in ws))
-    print(f"{top_pct:.0f}%{(' ' + mark) if mark else ''} | {FONT}")
+    # ── Menu bar line: the hottest window, whichever it is ──
+    # Shows the highest percentage across all windows (session, weekly, Fable,
+    # …) prefixed with that window's short name, so you always see the limit
+    # you're closest to. Ties go to the session window (ws[0]). The marker is
+    # ! at WARN_AT, !! at ALERT_AT. No colour or emoji anywhere — plain text
+    # only, so it reads cleanly in both light and dark menu bars.
+    top_label, top_pct, _ = max(ws, key=lambda w: w[1])
+    short = top_label.split(" (")[0]
+    mark = sigil(top_pct)
+    print(f"{short} {top_pct:.0f}%{(' ' + mark) if mark else ''} | {FONT}")
 
     # ── Dropdown: session first, then the rest worst-first ──
     print("---")

@@ -4,7 +4,7 @@ See how much of your Claude usage you've burned through — right in your Mac's
 menu bar.
 
 ```
-                                    ⌘  30% !  🔋  Wed 14:22
+                                    ⌘  Weekly 52% !  🔋  Wed 14:22
 ```
 
 Click it and you get the full picture:
@@ -68,17 +68,15 @@ If the menu bar says **"Not logged in to Claude Code"**, open Terminal, run
 
 ## Reading it
 
-The menu bar shows your **5-hour session window** — the one that matters
-minute-to-minute — as a single percentage.
+The menu bar shows your **hottest window**, whichever limit you're closest to
+(session, weekly, Fable, …), with its name in front.
 
 | What you see | What it means |
 |---|---|
-| `30%` | 30% of your session window used, everything's fine |
-| `52% !` | something has passed 50% — worth knowing |
-| `88% !!` | something has passed 80% — you're close to a limit |
+| `Session 30%` | your 5-hour session is the highest at 30%, everything's fine |
+| `Weekly 52% !` | your weekly limit is the highest and past 50%, worth knowing |
+| `Fable 88% !!` | your Fable limit is past 80%, you're close to it |
 
-The `!` markers track your **hottest** window, not just the session one. So a
-nearly-full weekly limit still warns you even while your session sits at 5%.
 Click the widget to see which window it is.
 
 The dropdown lists every window you have — session first, then worst-first —
@@ -182,6 +180,22 @@ Windows come from the response's structured `limits[]` array, which carries
 per-model scopes (like Fable) with real display names. It falls back to the
 older top-level `five_hour` / `seven_day` keys if `limits[]` is absent. Either
 way, new windows appear automatically without a code change.
+
+### Start SwiftBar with Claude Code
+
+To have SwiftBar launch whenever you start Claude Code, add a `SessionStart`
+hook to `~/.claude/settings.json`:
+
+```json
+"hooks": {
+  "SessionStart": [
+    { "hooks": [ { "type": "command",
+      "command": "pgrep -xq SwiftBar || open -g -a SwiftBar >/dev/null 2>&1 || true" } ] }
+  ]
+}
+```
+
+It does nothing if SwiftBar is already running.
 
 ### Permissions note
 
